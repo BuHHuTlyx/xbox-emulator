@@ -205,6 +205,10 @@ unsafe fn render(as_name: &str, ms_name: &str, groups: u32) -> Result<([[u32; 4]
 
 unsafe fn render_pair(ta: &Translated, tm: &Translated, groups: u32, consts: &[u32]) -> Result<([[u32; 4]; W], [u32; 3]), String> {
     let asb = dxc::compile(&ta.hlsl, &dxc::profile_for(ta.profile)).map_err(|e| format!("{e}\n{}", ta.hlsl))?;
+    render_pair_with_as_bytecode(ta, tm, groups, consts, &asb)
+}
+
+unsafe fn render_pair_with_as_bytecode(ta: &Translated, tm: &Translated, groups: u32, consts: &[u32], asb: &[u8]) -> Result<([[u32; 4]; W], [u32; 3]), String> {
     let msb = dxc::compile(&tm.hlsl, &dxc::profile_for(tm.profile)).map_err(|e| format!("{e}\n{}", tm.hlsl))?;
     let psb = dxc::compile(PS, "ps_6_5")?;
     let _warp = std::env::var_os("TOMBOX_EXEC_HW").is_none().then(|| WARP_RENDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -213,7 +217,7 @@ unsafe fn render_pair(ta: &Translated, tm: &Translated, groups: u32, consts: &[u
     let rs = root_signature(&gpu, consts.len() as u32);
     let mut s = Vec::new();
     sub(&mut s, 0, &(rs as u64).to_le_bytes());
-    sub(&mut s, 24, &bytecode(&asb));
+    sub(&mut s, 24, &bytecode(asb));
     sub(&mut s, 25, &bytecode(&msb));
     sub(&mut s, 2, &bytecode(&psb));
     let mut rast = [0u32; 11];
@@ -499,6 +503,101 @@ fn synthetic_pair_disassembles_to_the_ring_abi_shape() {
     let flat: Vec<_> = a.iter().chain(&m).filter(|i| i.enc == rdna2::Enc::Flat).collect();
     assert_eq!(flat.len(), 3);
     assert!(flat.iter().all(|i| i.aux.mask == 2 && matches!(i.src.get(2), Some(rdna2::Opnd::Sgpr(_)))), "{flat:?}");
+}
+
+fn handwritten_shader(profile: &'static str, hlsl: String) -> Translated {
+    Translated {
+        hlsl,
+        entry: "main",
+        profile,
+        mip_uavs: Vec::new(),
+        mip_srvs: Vec::new(),
+        needs_gmem: false,
+        needs_global: false,
+        uses_typed_atomic64: false,
+        user_data_base: None,
+        cb_limits: Default::default(),
+        fmask: Vec::new(),
+    }
+}
+
+#[test]
+fn handwritten_amplification_payload_atomics() {
+    let ms = handwritten_shader(
+        "ms_6_5",
+        r#"
+struct Payload { uint words[4]; };
+struct Vertex { float4 position : SV_Position; uint4 data : TEXCOORD0; };
+
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void main(in payload Payload p, out vertices Vertex verts[3], out indices uint3 tris[1]) {
+    SetMeshOutputCounts(3, 1);
+    tris[0] = uint3(0, 1, 2);
+    Vertex vertex;
+    vertex.data = uint4(p.words[0], p.words[1], p.words[2], p.words[3]);
+    vertex.position = float4(-1, -1, 0, 1);
+    verts[0] = vertex;
+    vertex.position = float4(-1, 3, 0, 1);
+    verts[1] = vertex;
+    vertex.position = float4(3, -1, 0, 1);
+    verts[2] = vertex;
+}
+"#.into(),
+    );
+
+    let want = [0x1413_1211, 0x1234_5678, 0x1234_5678, 0x1234_5678];
+    let want_readback = [want[0], want[0], want[2], want[3]];
+    let hardware = std::env::var_os("TOMBOX_EXEC_HW").is_some();
+    for (label, index, target, copy, expected) in [
+        ("direct constant", "0u", "p.words", "", want),
+        ("direct group id", "group.x & 3u", "p.words", "", want),
+        ("direct with AS readback", "group.x & 3u", "p.words", "if (lane == 0u) p.words[1] = p.words[k];", want_readback),
+        (
+            "direct with atomic AS readback",
+            "group.x & 3u",
+            "p.words",
+            "if (lane == 0u) { uint seen; InterlockedOr(p.words[k], 0u, seen); p.words[1] = seen; }",
+            want_readback,
+        ),
+        ("staged group id", "group.x & 3u", "staged", "if (lane < 4u) p.words[lane] = staged[lane];", want),
+    ] {
+        let source = r#"
+struct Payload { uint words[4]; };
+groupshared Payload p;
+groupshared uint staged[4];
+
+[numthreads(32, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    if (lane < 4u) TARGET[lane] = 0x12345678u;
+    GroupMemoryBarrierWithGroupSync();
+    uint k = INDEX;
+    uint byte = lane & 3u;
+    uint shift = 8u * byte;
+    uint old;
+    InterlockedAnd(TARGET[k], ~(0xffu << shift), old);
+    InterlockedOr(TARGET[k], (0x11u + byte) << shift, old);
+    GroupMemoryBarrierWithGroupSync();
+    COPY
+    DispatchMesh(1u, 1u, 1u, p);
+}
+"#
+        .replace("TARGET", target)
+        .replace("INDEX", index)
+        .replace("COPY", copy);
+        let amplification = handwritten_shader("as_6_5", source);
+        for flags in [&[][..], &["-Od"][..]] {
+            let code = dxc::compile_with(&amplification.hlsl, amplification.profile, flags).unwrap_or_else(|e| panic!("{label} {flags:?}: {e}"));
+            let dxil = dxc::disassemble(&code).unwrap_or_else(|e| panic!("{label} {flags:?}: {e}"));
+            assert!(dxil.contains("atomicrmw and") && dxil.contains("atomicrmw or"), "{label} {flags:?}: masked atomics missing from DXIL");
+            let (pixels, _) = unsafe { render_pair_with_as_bytecode(&amplification, &ms, 1, &[], &code) }.unwrap_or_else(|e| panic!("{label} {flags:?}: {e}"));
+            assert!(pixels.iter().all(|p| *p == pixels[0]), "{label} {flags:?}: {pixels:x?}");
+            eprintln!("{label} {flags:?}: {:08x?}, expected {expected:08x?}", pixels[0]);
+            if target == "staged" || !hardware {
+                assert_eq!(pixels[0], expected, "{label} {flags:?}");
+            }
+        }
+    }
 }
 
 #[test]
